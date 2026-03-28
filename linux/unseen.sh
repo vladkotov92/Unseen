@@ -232,6 +232,31 @@ fetch_info() {
     printf "${YELLOW}Press CTRL+C to disconnect${RESET}\n"
 }
 
+# Change Tor identity
+change_identity() {
+    printf "${YELLOW}[~] Changing identity...${RESET}\n"
+    sudo systemctl reload tor 2>/dev/null || sudo service tor reload 2>/dev/null || pkill -HUP -x tor 2>/dev/null
+    sleep 3
+    printf "${YELLOW}[~] Identity changed.${RESET}\n"
+}
+
+# Ask user whether to enable IP rotation
+choose_rotation() {
+    printf "${YELLOW}[?] Enable IP rotation? [y/n]: ${RESET}"
+    read -r ROTATE_IP
+    ROTATE_IP=$(echo "$ROTATE_IP" | tr '[:upper:]' '[:lower:]')
+
+    if [ "$ROTATE_IP" = "y" ]; then
+        printf "${YELLOW}[?] Rotate every how many seconds? (min 10): ${RESET}"
+        read -r ROTATE_INTERVAL
+        if ! echo "$ROTATE_INTERVAL" | grep -qE '^[0-9]+$' || [ "$ROTATE_INTERVAL" -lt 10 ]; then
+            printf "${RED}[!] Invalid interval. Using 60 seconds.${RESET}\n"
+            ROTATE_INTERVAL=60
+        fi
+        printf "${GREEN}[+] IP will rotate every ${ROTATE_INTERVAL} seconds.${RESET}\n"
+    fi
+}
+
 # Cleanup on exit
 cleanup() {
     printf "\n${RED}[!] Disconnecting...${RESET}\n"
@@ -247,11 +272,25 @@ main() {
     display_banner
     check_root
     check_dependencies
-    choose_exit_node
+    choose_rotation
+    if [ "$ROTATE_IP" = "y" ]; then
+        rm -f /tmp/torrc
+    else
+        choose_exit_node
+    fi
     start_tor
     set_proxy
     fetch_info
-    while true; do sleep 1; done
+
+    if [ "$ROTATE_IP" = "y" ]; then
+        while true; do
+            sleep "$ROTATE_INTERVAL"
+            change_identity
+            fetch_info
+        done
+    else
+        while true; do sleep 1; done
+    fi
 }
 
 main

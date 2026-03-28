@@ -1,4 +1,4 @@
-# unseen
+# Unseen
 
 Route your internet traffic anonymously through the Tor network, directly from your terminal.
 
@@ -107,4 +107,4 @@ GitHub: [https://github.com/vladkotov92](https://github.com/vladkotov92)
 
 ## License
 
-MIT — see [LICENSE.md](LICENSE.md)
+MIT — see [LICENSE](LICENSE)

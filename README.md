@@ -23,12 +23,6 @@ Route your internet traffic anonymously through the Tor network, directly from y
 - Shows your anonymous IP, country, region and city once connected
 - On exit (`CTRL+C`), automatically stops Tor and resets all proxy settings
 
-## Requirements
-
-- macOS
-- [Homebrew](https://brew.sh)
-- `tor` and `jq` (installed automatically by `install.sh`)
-
 ## Installation
 
 Clone the repository and run the installer:

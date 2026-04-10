@@ -40,6 +40,8 @@ bash install.sh
 bash unseen.sh
 ```
 
+On virtual machines (VMs), configure the browser's Network Settings to use Manual proxy configuration. Set the SOCKS Host to 127.0.0.1 and the Port to 9050.
+
 On every run you will first be asked whether you want IP rotation:
 
 ```

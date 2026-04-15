@@ -7,6 +7,9 @@ GREEN="\033[92m"
 YELLOW="\033[93m"
 RED="\033[91m"
 
+KILL_SWITCH=0
+TOR_SYS_USER=""
+
 # Display banner
 display_banner() {
     clear
@@ -158,6 +161,18 @@ handle_exit_node_error() {
     esac
 }
 
+# Detect dedicated Tor system user (needed for kill switch isolation)
+detect_tor_user() {
+    for u in debian-tor tor _tor; do
+        if id "$u" >/dev/null 2>&1; then
+            TOR_SYS_USER="$u"
+            return 0
+        fi
+    done
+    TOR_SYS_USER=""
+    return 1
+}
+
 # Start Tor
 start_tor() {
     printf "${YELLOW}[+] Starting Tor...${RESET}\n"
@@ -166,10 +181,22 @@ start_tor() {
     pkill -x tor 2>/dev/null
     sleep 1
 
-    if [ -f /tmp/torrc ]; then
-        tor -f /tmp/torrc > /tmp/tor.log 2>&1 &
+    detect_tor_user
+
+    rm -f /tmp/tor.log
+    if [ -n "$TOR_SYS_USER" ]; then
+        [ -f /tmp/torrc ] && chmod 644 /tmp/torrc
+        if [ -f /tmp/torrc ]; then
+            sudo -u "$TOR_SYS_USER" tor -f /tmp/torrc --Log "notice file /tmp/tor.log" >/dev/null 2>&1 &
+        else
+            sudo -u "$TOR_SYS_USER" tor --Log "notice file /tmp/tor.log" >/dev/null 2>&1 &
+        fi
     else
-        tor > /tmp/tor.log 2>&1 &
+        if [ -f /tmp/torrc ]; then
+            tor -f /tmp/torrc > /tmp/tor.log 2>&1 &
+        else
+            tor > /tmp/tor.log 2>&1 &
+        fi
     fi
 
     printf "${YELLOW}[+] Waiting for bootstrap${RESET}"
@@ -190,6 +217,19 @@ start_tor() {
 stop_tor() {
     pkill -x tor 2>/dev/null
     sleep 1
+}
+
+# Monitor Tor process and alert if it drops
+MONITOR_PID=""
+monitor_tor() {
+    while true; do
+        sleep 5
+        if ! pgrep -x tor >/dev/null 2>&1; then
+            printf "\n${RED}[!] Tor has dropped!${RESET}\n"
+            [ "$KILL_SWITCH" -eq 1 ] && printf "${RED}[!] Kill Switch active — all traffic is blocked.${RESET}\n"
+            break
+        fi
+    done
 }
 
 # Fetch IP and location through Tor
@@ -229,7 +269,17 @@ fetch_info() {
     printf "${BOLD}Region:${RESET}  ${GREEN}${REGION}${RESET}\n"
     printf "${BOLD}City:${RESET}    ${GREEN}${CITY}${RESET}\n"
     printf "${GREEN}──────────────────────${RESET}\n\n"
-    printf "${YELLOW}Press CTRL+C to disconnect${RESET}\n"
+    printf "${YELLOW}Press CTRL+C to disconnect  |  CTRL+R to restart${RESET}\n"
+}
+
+# Full restart — clean up and re-run the script from scratch
+restart_program() {
+    printf "\n${YELLOW}[~] Restarting...${RESET}\n"
+    [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
+    [ "$KILL_SWITCH" -eq 1 ] && kill_switch_disable
+    reset_proxy
+    stop_tor
+    exec bash "$0"
 }
 
 # Change Tor identity
@@ -238,6 +288,47 @@ change_identity() {
     sudo systemctl reload tor 2>/dev/null || sudo service tor reload 2>/dev/null || pkill -HUP -x tor 2>/dev/null
     sleep 3
     printf "${YELLOW}[~] Identity changed.${RESET}\n"
+}
+
+# Ask user whether to enable Kill Switch
+choose_kill_switch() {
+    printf "${YELLOW}[?] Enable Kill Switch? (blocks all traffic if Tor drops) [y/n]: ${RESET}"
+    read -r KS_CHOICE
+    KS_CHOICE=$(echo "$KS_CHOICE" | tr '[:upper:]' '[:lower:]')
+    if [ "$KS_CHOICE" = "y" ]; then
+        KILL_SWITCH=1
+        printf "${GREEN}[+] Kill Switch will be enabled.${RESET}\n"
+    else
+        KILL_SWITCH=0
+    fi
+}
+
+# Enable Kill Switch via iptables
+kill_switch_enable() {
+    printf "${YELLOW}[+] Enabling Kill Switch...${RESET}\n"
+    if [ -z "$TOR_SYS_USER" ]; then
+        printf "${RED}[!] No dedicated Tor system user found (debian-tor/tor/_tor).${RESET}\n"
+        printf "${RED}[!] Kill Switch cannot isolate Tor traffic safely — skipping.${RESET}\n"
+        KILL_SWITCH=0
+        return 1
+    fi
+    iptables -N UNSEEN_KS 2>/dev/null
+    iptables -F UNSEEN_KS 2>/dev/null
+    # Allow loopback (covers SOCKS proxy on 127.0.0.1:9050)
+    iptables -A UNSEEN_KS -o lo -j ACCEPT
+    # Allow Tor's own outbound traffic (connects to Tor relays)
+    iptables -A UNSEEN_KS -m owner --uid-owner "$TOR_SYS_USER" -j ACCEPT
+    # Block everything else
+    iptables -A UNSEEN_KS -j DROP
+    iptables -I OUTPUT -j UNSEEN_KS
+    printf "${GREEN}[+] Kill Switch enabled. All traffic is blocked except through Tor (${TOR_SYS_USER}).${RESET}\n"
+}
+
+# Disable Kill Switch
+kill_switch_disable() {
+    iptables -D OUTPUT -j UNSEEN_KS 2>/dev/null
+    iptables -F UNSEEN_KS 2>/dev/null
+    iptables -X UNSEEN_KS 2>/dev/null
 }
 
 # Ask user whether to enable IP rotation
@@ -260,6 +351,8 @@ choose_rotation() {
 # Cleanup on exit
 cleanup() {
     printf "\n${RED}[!] Disconnecting...${RESET}\n"
+    [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
+    [ "$KILL_SWITCH" -eq 1 ] && kill_switch_disable
     reset_proxy
     stop_tor
     printf "${GREEN}[+] Done. Goodbye.${RESET}\n"
@@ -272,7 +365,9 @@ main() {
     display_banner
     check_root
     check_dependencies
+    kill_switch_disable
     choose_rotation
+    choose_kill_switch
     if [ "$ROTATE_IP" = "y" ]; then
         rm -f /tmp/torrc
     else
@@ -280,16 +375,29 @@ main() {
     fi
     start_tor
     set_proxy
+    [ "$KILL_SWITCH" -eq 1 ] && kill_switch_enable
     fetch_info
+    monitor_tor &
+    MONITOR_PID=$!
 
     if [ "$ROTATE_IP" = "y" ]; then
         while true; do
-            sleep "$ROTATE_INTERVAL"
+            elapsed=0
+            while [ "$elapsed" -lt "$ROTATE_INTERVAL" ]; do
+                if read -r -t 1 -n 1 key 2>/dev/null && [ "$key" = $'\x12' ]; then
+                    restart_program
+                fi
+                elapsed=$((elapsed + 1))
+            done
             change_identity
             fetch_info
         done
     else
-        while true; do sleep 1; done
+        while true; do
+            if read -r -t 1 -n 1 key 2>/dev/null && [ "$key" = $'\x12' ]; then
+                restart_program
+            fi
+        done
     fi
 }
 

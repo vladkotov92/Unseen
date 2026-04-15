@@ -18,6 +18,7 @@ Route your internet traffic anonymously through the Tor network, directly from y
 
 - Starts a Tor process on your machine
 - Optionally rotates your IP automatically at a chosen interval
+- Optionally enables a Kill Switch to block all traffic if Tor drops unexpectedly
 - Lets you choose a fixed exit node country, or let Tor pick automatically (only when rotation is disabled)
 - Detects if Tor ignores the exit node constraint and lets you retry or switch
 - Routes all network traffic through the Tor SOCKS5 proxy (`127.0.0.1:9050`)
@@ -42,20 +43,13 @@ bash unseen.sh
 
 On virtual machines (VMs), configure the browser's Network Settings to use Manual proxy configuration. Set the SOCKS Host to 127.0.0.1 and the Port to 9050.
 
-On every run you will first be asked whether you want IP rotation:
+On every run you will be asked a series of questions before connecting:
+
+**1. IP rotation**
 
 ```
 [?] Enable IP rotation? [y/n]:
 ```
-
-**If you choose `n`**, you will then be asked for an exit node country:
-
-```
-[+] Exit node country (e.g. US, DE, NL, FR, IT)
-    Press ENTER to let Tor choose automatically:
-```
-
-Type a country code (e.g. `DE`, `NL`, `US`) or press `ENTER` to let Tor choose automatically.
 
 **If you choose `y`**, you will be asked how often to rotate (in seconds):
 
@@ -64,6 +58,23 @@ Type a country code (e.g. `DE`, `NL`, `US`) or press `ENTER` to let Tor choose a
 ```
 
 Tor will start with a random exit node and automatically change identity at the specified interval, refreshing your IP and location info each time.
+
+**2. Kill Switch**
+
+```
+[?] Enable Kill Switch? (blocks all traffic if Tor drops) [y/n]:
+```
+
+If enabled, all outbound traffic is blocked the moment Tor drops unexpectedly — your real IP is never exposed. On **Linux** this is enforced via `iptables`; on **macOS** via a background monitor that triggers an immediate disconnect.
+
+**3. Exit node country** *(only when rotation is disabled)*
+
+```
+[+] Exit node country (e.g. US, DE, NL, FR, IT)
+    Press ENTER to let Tor choose automatically:
+```
+
+Type a country code (e.g. `DE`, `NL`, `US`) or press `ENTER` to let Tor choose automatically.
 
 Once connected you will see:
 
@@ -76,7 +87,7 @@ Region:  North Holland
 City:    Amsterdam
 ──────────────────────
 
-Press CTRL+C to disconnect
+Press CTRL+C to disconnect  |  CTRL+R to restart
 ```
 
 If the requested exit country is unavailable, the script will detect it and ask:
@@ -92,6 +103,8 @@ If the requested exit country is unavailable, the script will detect it and ask:
 
 Press `CTRL+C` at any time to disconnect. The script will automatically stop Tor and restore your original network settings.
 
+Press `CTRL+R` at any time to do a full restart — cleans up Tor, the Kill Switch and the proxy, then re-runs the script from the beginning so you can choose new settings.
+
 ## Exit node country codes
 
 Some countries have many reliable exit nodes, others have few or none.
@@ -104,14 +117,16 @@ Some countries have many reliable exit nodes, others have few or none.
 ## How it works
 
 1. Asks whether to enable IP rotation
-2. If rotation is disabled, asks for an exit node country (optional); if enabled, any previous exit node config is cleared so Tor picks randomly
-3. Stops any existing Tor instance to avoid conflicts
-4. Starts Tor as the current user and waits for a full bootstrap (100%)
-5. Enables the SOCKS5 proxy on all active network interfaces
-6. Fetches your anonymous IP and location through the Tor circuit
-7. Verifies the exit country matches the requested one (only when rotation is off) — if not, prompts to retry
-8. If rotation is on, changes Tor identity and refreshes connection info at the chosen interval
-9. On exit, disables the proxy and kills the Tor process
+2. Asks whether to enable the Kill Switch
+3. If rotation is disabled, asks for an exit node country (optional); if enabled, any previous exit node config is cleared so Tor picks randomly
+4. Stops any existing Tor instance to avoid conflicts
+5. Starts Tor as the current user and waits for a full bootstrap (100%)
+6. Enables the SOCKS5 proxy on all active network interfaces
+7. If Kill Switch is enabled, enforces traffic blocking rules
+8. Fetches your anonymous IP and location through the Tor circuit
+9. Verifies the exit country matches the requested one (only when rotation is off) — if not, prompts to retry
+10. If rotation is on, changes Tor identity and refreshes connection info at the chosen interval
+11. On exit, disables the Kill Switch (if active), resets the proxy and kills the Tor process
 
 ## Notes
 

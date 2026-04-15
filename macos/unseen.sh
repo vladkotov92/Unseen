@@ -7,6 +7,9 @@ GREEN="\033[92m"
 YELLOW="\033[93m"
 RED="\033[91m"
 
+KILL_SWITCH=0
+MONITOR_PID=""
+
 # Display banner
 display_banner() {
     clear
@@ -189,6 +192,31 @@ change_identity() {
     printf "${YELLOW}[~] Identity changed.${RESET}\n"
 }
 
+# Ask user whether to enable Kill Switch
+choose_kill_switch() {
+    printf "${YELLOW}[?] Enable Kill Switch? (disconnects immediately if Tor drops) [y/n]: ${RESET}"
+    read -r KS_CHOICE
+    KS_CHOICE=$(echo "$KS_CHOICE" | tr '[:upper:]' '[:lower:]')
+    if [ "$KS_CHOICE" = "y" ]; then
+        KILL_SWITCH=1
+        printf "${GREEN}[+] Kill Switch will be enabled.${RESET}\n"
+    else
+        KILL_SWITCH=0
+    fi
+}
+
+# Monitor Tor process and trigger cleanup if it dies
+kill_switch_monitor() {
+    while true; do
+        sleep 5
+        if ! pgrep -x tor > /dev/null; then
+            printf "\n${RED}[!] Tor process died — Kill Switch activated!${RESET}\n"
+            cleanup
+        fi
+    done &
+    MONITOR_PID=$!
+}
+
 # Ask user whether to enable IP rotation
 choose_rotation() {
     printf "${YELLOW}[?] Enable IP rotation? [y/n]: ${RESET}"
@@ -209,6 +237,7 @@ choose_rotation() {
 # Cleanup on exit
 cleanup() {
     printf "\n${RED}[!] Disconnecting...${RESET}\n"
+    [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
     reset_proxy
     stop_tor
     printf "${GREEN}[+] Done. Goodbye.${RESET}\n"
@@ -221,6 +250,8 @@ main() {
     display_banner
     check_dependencies
     choose_rotation
+    cleanup
+    choose_kill_switch
     if [ "$ROTATE_IP" = "y" ]; then
         rm -f /tmp/torrc
     else
@@ -228,6 +259,7 @@ main() {
     fi
     start_tor
     set_proxy
+    [ "$KILL_SWITCH" -eq 1 ] && kill_switch_monitor
     fetch_info
 
     if [ "$ROTATE_IP" = "y" ]; then

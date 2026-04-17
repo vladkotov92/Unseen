@@ -9,6 +9,8 @@ RED="\033[91m"
 
 KILL_SWITCH=0
 TOR_SYS_USER=""
+DNS_PROTECTED=0
+TRANS_PROXY=0
 
 # Display banner
 display_banner() {
@@ -118,11 +120,22 @@ choose_exit_node() {
     if [ -z "$EXIT_NODE" ]; then
         printf "${GREEN}[+] Using automatic exit node.${RESET}\n"
         EXIT_NODE=""
+        cat > /tmp/torrc << EOF
+SocksPort 9050
+DNSPort 9053
+TransPort 9040
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
+EOF
     else
         EXIT_NODE=$(echo "$EXIT_NODE" | tr '[:lower:]' '[:upper:]')
         printf "${GREEN}[+] Exit node set to: ${EXIT_NODE}${RESET}\n"
         cat > /tmp/torrc << EOF
 SocksPort 9050
+DNSPort 9053
+TransPort 9040
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
 ExitNodes {${EXIT_NODE}}
 StrictNodes 1
 GeoIPExcludeUnknown 1
@@ -148,8 +161,14 @@ handle_exit_node_error() {
             ;;
         2)
             printf "${GREEN}[+] Using automatic exit node.${RESET}\n"
-            rm -f /tmp/torrc
             EXIT_NODE=""
+            cat > /tmp/torrc << EOF
+SocksPort 9050
+DNSPort 9053
+TransPort 9040
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
+EOF
             start_tor
             set_proxy
             fetch_info
@@ -277,6 +296,8 @@ restart_program() {
     printf "\n${YELLOW}[~] Restarting...${RESET}\n"
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_disable
+    trans_proxy_disable
+    dns_protect_disable
     reset_proxy
     stop_tor
     exec bash "$0"
@@ -314,8 +335,14 @@ kill_switch_enable() {
     fi
     iptables -N UNSEEN_KS 2>/dev/null
     iptables -F UNSEEN_KS 2>/dev/null
-    # Allow loopback (covers SOCKS proxy on 127.0.0.1:9050)
+    # Allow loopback interface
     iptables -A UNSEEN_KS -o lo -j ACCEPT
+    # Allow traffic redirected to loopback by trans_proxy (destination rewritten by NAT)
+    iptables -A UNSEEN_KS -d 127.0.0.0/8 -j ACCEPT
+    # Allow LAN (private networks, RETURNed by trans_proxy)
+    iptables -A UNSEEN_KS -d 10.0.0.0/8 -j ACCEPT
+    iptables -A UNSEEN_KS -d 172.16.0.0/12 -j ACCEPT
+    iptables -A UNSEEN_KS -d 192.168.0.0/16 -j ACCEPT
     # Allow Tor's own outbound traffic (connects to Tor relays)
     iptables -A UNSEEN_KS -m owner --uid-owner "$TOR_SYS_USER" -j ACCEPT
     # Block everything else
@@ -329,6 +356,70 @@ kill_switch_disable() {
     iptables -D OUTPUT -j UNSEEN_KS 2>/dev/null
     iptables -F UNSEEN_KS 2>/dev/null
     iptables -X UNSEEN_KS 2>/dev/null
+}
+
+# Enable DNS leak protection (resolv.conf only)
+dns_protect_enable() {
+    printf "${YELLOW}[+] Locking resolv.conf to 127.0.0.1...${RESET}\n"
+    cp /etc/resolv.conf /tmp/resolv.conf.bak 2>/dev/null
+    chattr -i /etc/resolv.conf 2>/dev/null
+    printf "nameserver 127.0.0.1\n" > /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null
+    DNS_PROTECTED=1
+}
+
+# Disable DNS leak protection
+dns_protect_disable() {
+    if [ "$DNS_PROTECTED" -eq 1 ]; then
+        chattr -i /etc/resolv.conf 2>/dev/null
+        if [ -f /tmp/resolv.conf.bak ]; then
+            cp /tmp/resolv.conf.bak /etc/resolv.conf
+            rm -f /tmp/resolv.conf.bak
+        fi
+        DNS_PROTECTED=0
+    fi
+}
+
+# Enable transparent proxy — redirects all TCP + DNS through Tor via iptables NAT
+trans_proxy_enable() {
+    if [ -z "$TOR_SYS_USER" ]; then
+        printf "${RED}[!] No dedicated Tor system user found — transparent proxy disabled.${RESET}\n"
+        printf "${RED}[!] Traffic will NOT be routed through Tor automatically.${RESET}\n"
+        return 1
+    fi
+    printf "${YELLOW}[+] Enabling transparent proxy (all traffic → Tor)...${RESET}\n"
+    iptables -t nat -N UNSEEN_TP 2>/dev/null
+    iptables -t nat -F UNSEEN_TP 2>/dev/null
+    # Never touch Tor's own outbound traffic (prevents loops)
+    iptables -t nat -A UNSEEN_TP -m owner --uid-owner "$TOR_SYS_USER" -j RETURN
+    # Redirect DNS to Tor's DNSPort
+    iptables -t nat -A UNSEEN_TP -p udp --dport 53 -j REDIRECT --to-ports 9053
+    iptables -t nat -A UNSEEN_TP -p tcp --dport 53 -j REDIRECT --to-ports 9053
+    # Skip loopback
+    iptables -t nat -A UNSEEN_TP -o lo -j RETURN
+    iptables -t nat -A UNSEEN_TP -d 127.0.0.0/8 -j RETURN
+    # Redirect Tor's VirtualAddr range to TransPort (must come before private-net RETURNs)
+    iptables -t nat -A UNSEEN_TP -d 10.192.0.0/10 -p tcp -j REDIRECT --to-ports 9040
+    # Preserve LAN connectivity
+    iptables -t nat -A UNSEEN_TP -d 10.0.0.0/8 -j RETURN
+    iptables -t nat -A UNSEEN_TP -d 172.16.0.0/12 -j RETURN
+    iptables -t nat -A UNSEEN_TP -d 192.168.0.0/16 -j RETURN
+    # Redirect everything else TCP to Tor's TransPort
+    iptables -t nat -A UNSEEN_TP -p tcp --syn -j REDIRECT --to-ports 9040
+    # Hook into OUTPUT
+    iptables -t nat -I OUTPUT -j UNSEEN_TP
+    TRANS_PROXY=1
+    printf "${GREEN}[+] Transparent proxy active — all TCP/DNS routed through Tor.${RESET}\n"
+}
+
+# Disable transparent proxy
+trans_proxy_disable() {
+    if [ "$TRANS_PROXY" -eq 1 ]; then
+        iptables -t nat -D OUTPUT -j UNSEEN_TP 2>/dev/null
+        iptables -t nat -F UNSEEN_TP 2>/dev/null
+        iptables -t nat -X UNSEEN_TP 2>/dev/null
+        TRANS_PROXY=0
+    fi
 }
 
 # Ask user whether to enable IP rotation
@@ -353,6 +444,8 @@ cleanup() {
     printf "\n${RED}[!] Disconnecting...${RESET}\n"
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_disable
+    trans_proxy_disable
+    dns_protect_disable
     reset_proxy
     stop_tor
     printf "${GREEN}[+] Done. Goodbye.${RESET}\n"
@@ -369,12 +462,20 @@ main() {
     choose_rotation
     choose_kill_switch
     if [ "$ROTATE_IP" = "y" ]; then
-        rm -f /tmp/torrc
+        cat > /tmp/torrc << EOF
+SocksPort 9050
+DNSPort 9053
+TransPort 9040
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
+EOF
     else
         choose_exit_node
     fi
     start_tor
     set_proxy
+    dns_protect_enable
+    trans_proxy_enable
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_enable
     fetch_info
     monitor_tor &

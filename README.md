@@ -22,8 +22,10 @@ Route your internet traffic anonymously through the Tor network, directly from y
 - Lets you choose a fixed exit node country, or let Tor pick automatically (only when rotation is disabled)
 - Detects if Tor ignores the exit node constraint and lets you retry or switch
 - Routes all network traffic through the Tor SOCKS5 proxy (`127.0.0.1:9050`)
+- **DNS leak protection** — forces every DNS query through Tor's `DNSPort` so your ISP cannot see what you're resolving
+- **Transparent proxy** (Linux) — redirects all TCP traffic through Tor via `iptables` NAT, so every application is routed through Tor even if it ignores system proxy settings
 - Shows your anonymous IP, country, region and city once connected
-- On exit (`CTRL+C`), automatically stops Tor and resets all proxy settings
+- On exit (`CTRL+C`), automatically stops Tor and resets all proxy, DNS and firewall settings
 
 ## Installation
 
@@ -103,7 +105,42 @@ If the requested exit country is unavailable, the script will detect it and ask:
 
 Press `CTRL+C` at any time to disconnect. The script will automatically stop Tor and restore your original network settings.
 
-Press `CTRL+R` at any time to do a full restart — cleans up Tor, the Kill Switch and the proxy, then re-runs the script from the beginning so you can choose new settings.
+Press `CTRL+R` at any time to do a full restart — cleans up Tor, the Kill Switch, the transparent proxy and the DNS overrides, then re-runs the script from the beginning so you can choose new settings.
+
+## DNS leak protection
+
+DNS leak protection is **always enabled** — no prompt, no opt-out.
+
+Tor is configured with `DNSPort 9053` and `AutomapHostsOnResolve 1`, so it acts as a local DNS resolver that routes queries through the onion network.
+
+- On **Linux**, `/etc/resolv.conf` is locked (`chattr +i`) to `nameserver 127.0.0.1` and an `iptables` NAT rule redirects all port 53 traffic (UDP/TCP) to `127.0.0.1:9053`. Your ISP never sees a single DNS query.
+- On **macOS**, every active network service has its DNS servers overridden to `127.0.0.1` via `networksetup -setdnsservers`, with the original values backed up and restored on exit.
+
+## Transparent proxy (Linux)
+
+On Linux, Unseen adds a transparent proxy layer so that **every application** — including browsers that ignore system proxy settings — goes through Tor.
+
+It works by:
+- Adding `TransPort 9040` and `VirtualAddrNetworkIPv4 10.192.0.0/10` to Tor's config
+- Creating an `iptables` NAT chain (`UNSEEN_TP`) that redirects all outgoing TCP traffic to `127.0.0.1:9040`, while:
+  - Leaving Tor's own traffic untouched (matched by its system user, e.g. `debian-tor`)
+  - Skipping loopback and private LAN ranges
+  - Redirecting Tor's virtual address range (`10.192.0.0/10`) back to the TransPort
+
+Requires a dedicated Tor system user (`debian-tor`, `tor`, or `_tor`) to avoid traffic loops. The installer ensures Tor is installed from your distro's package manager, which creates this user automatically.
+
+On macOS the transparent proxy is not needed — `networksetup -setsocksfirewallproxy` applies system-wide and browsers honor it.
+
+## Testing for leaks
+
+Once connected, verify that everything is actually routed through Tor:
+
+1. **IP check** — https://check.torproject.org
+   Should say *"Congratulations. This browser is configured to use Tor."*
+2. **DNS leak test** — https://dnsleaktest.com → run the *Extended test*
+   You should see **only** Tor exit-relay resolvers. No ISP, Google (`8.8.8.8`), or Cloudflare (`1.1.1.1`) resolvers.
+3. **IPv6 / WebRTC** — https://ipleak.net
+   The IP shown must match the Tor exit node, not your real address.
 
 ## Exit node country codes
 
@@ -118,15 +155,18 @@ Some countries have many reliable exit nodes, others have few or none.
 
 1. Asks whether to enable IP rotation
 2. Asks whether to enable the Kill Switch
-3. If rotation is disabled, asks for an exit node country (optional); if enabled, any previous exit node config is cleared so Tor picks randomly
-4. Stops any existing Tor instance to avoid conflicts
-5. Starts Tor as the current user and waits for a full bootstrap (100%)
-6. Enables the SOCKS5 proxy on all active network interfaces
-7. If Kill Switch is enabled, enforces traffic blocking rules
-8. Fetches your anonymous IP and location through the Tor circuit
-9. Verifies the exit country matches the requested one (only when rotation is off) — if not, prompts to retry
-10. If rotation is on, changes Tor identity and refreshes connection info at the chosen interval
-11. On exit, disables the Kill Switch (if active), resets the proxy and kills the Tor process
+3. If rotation is disabled, asks for an exit node country (optional); if enabled, exit node is picked randomly
+4. Writes a `torrc` with `SocksPort 9050`, `DNSPort 9053`, and (on Linux) `TransPort 9040`
+5. Stops any existing Tor instance to avoid conflicts
+6. Starts Tor and waits for a full bootstrap (100%)
+7. Enables the SOCKS5 proxy on all active network interfaces
+8. Locks system DNS to `127.0.0.1` so all queries go through Tor's DNSPort
+9. (Linux) Installs `iptables` NAT rules to transparently redirect all TCP + DNS traffic through Tor
+10. If Kill Switch is enabled, enforces traffic blocking rules (Linux: `iptables` chain; macOS: background monitor)
+11. Fetches your anonymous IP and location through the Tor circuit
+12. Verifies the exit country matches the requested one (only when rotation is off) — if not, prompts to retry
+13. If rotation is on, changes Tor identity and refreshes connection info at the chosen interval
+14. On exit, tears down in reverse order: Kill Switch → transparent proxy → DNS overrides → SOCKS proxy → Tor process
 
 ## Notes
 

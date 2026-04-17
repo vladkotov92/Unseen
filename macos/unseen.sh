@@ -9,6 +9,7 @@ RED="\033[91m"
 
 KILL_SWITCH=0
 MONITOR_PID=""
+DNS_PROTECTED=0
 
 # Display banner
 display_banner() {
@@ -103,11 +104,18 @@ choose_exit_node() {
     if [ -z "$EXIT_NODE" ]; then
         printf "${GREEN}[+] Using automatic exit node.${RESET}\n"
         EXIT_NODE=""
+        cat > /tmp/torrc << EOF
+SocksPort 9050
+DNSPort 9053
+AutomapHostsOnResolve 1
+EOF
     else
         EXIT_NODE=$(echo "$EXIT_NODE" | tr '[:lower:]' '[:upper:]')
         printf "${GREEN}[+] Exit node set to: ${EXIT_NODE}${RESET}\n"
         cat > /tmp/torrc << EOF
 SocksPort 9050
+DNSPort 9053
+AutomapHostsOnResolve 1
 ExitNodes {${EXIT_NODE}}
 StrictNodes 1
 GeoIPExcludeUnknown 1
@@ -132,8 +140,12 @@ handle_exit_node_error() {
             ;;
         2)
             printf "${GREEN}[+] Using automatic exit node.${RESET}\n"
-            rm -f /tmp/torrc
             EXIT_NODE=""
+            cat > /tmp/torrc << EOF
+SocksPort 9050
+DNSPort 9053
+AutomapHostsOnResolve 1
+EOF
             start_tor
             set_proxy
             fetch_info
@@ -217,6 +229,41 @@ kill_switch_monitor() {
     MONITOR_PID=$!
 }
 
+# Enable DNS leak protection — route system DNS through Tor
+dns_protect_enable() {
+    printf "${YELLOW}[+] Enabling DNS leak protection...${RESET}\n"
+    : > /tmp/dns_backup.txt
+    while IFS= read -r service; do
+        [ -z "$service" ] && continue
+        current_dns=$(networksetup -getdnsservers "$service" 2>/dev/null)
+        if echo "$current_dns" | grep -q "There aren't"; then
+            echo "${service}|EMPTY" >> /tmp/dns_backup.txt
+        else
+            dns_line=$(echo "$current_dns" | tr '\n' ' ')
+            echo "${service}|${dns_line}" >> /tmp/dns_backup.txt
+        fi
+        networksetup -setdnsservers "$service" "127.0.0.1" 2>/dev/null
+    done <<< "$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | tail -n +2)"
+    DNS_PROTECTED=1
+    printf "${GREEN}[+] DNS leak protection active.${RESET}\n"
+}
+
+# Disable DNS leak protection — restore original DNS
+dns_protect_disable() {
+    if [ "$DNS_PROTECTED" -eq 1 ] && [ -f /tmp/dns_backup.txt ]; then
+        while IFS='|' read -r service dns_list; do
+            [ -z "$service" ] && continue
+            if [ "$dns_list" = "EMPTY" ] || [ -z "$dns_list" ]; then
+                networksetup -setdnsservers "$service" "Empty" 2>/dev/null
+            else
+                networksetup -setdnsservers "$service" $dns_list 2>/dev/null
+            fi
+        done < /tmp/dns_backup.txt
+        rm -f /tmp/dns_backup.txt
+        DNS_PROTECTED=0
+    fi
+}
+
 # Ask user whether to enable IP rotation
 choose_rotation() {
     printf "${YELLOW}[?] Enable IP rotation? [y/n]: ${RESET}"
@@ -238,6 +285,7 @@ choose_rotation() {
 cleanup() {
     printf "\n${RED}[!] Disconnecting...${RESET}\n"
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
+    dns_protect_disable
     reset_proxy
     stop_tor
     printf "${GREEN}[+] Done. Goodbye.${RESET}\n"
@@ -250,15 +298,19 @@ main() {
     display_banner
     check_dependencies
     choose_rotation
-    cleanup
     choose_kill_switch
     if [ "$ROTATE_IP" = "y" ]; then
-        rm -f /tmp/torrc
+        cat > /tmp/torrc << EOF
+SocksPort 9050
+DNSPort 9053
+AutomapHostsOnResolve 1
+EOF
     else
         choose_exit_node
     fi
     start_tor
     set_proxy
+    dns_protect_enable
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_monitor
     fetch_info
 

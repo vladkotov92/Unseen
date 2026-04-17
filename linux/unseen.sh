@@ -11,6 +11,10 @@ KILL_SWITCH=0
 TOR_SYS_USER=""
 DNS_PROTECTED=0
 TRANS_PROXY=0
+SPLIT_IPS=""
+HOSTS_MODIFIED=0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOMAINS_FILE="$SCRIPT_DIR/../domains.txt"
 
 # Display banner
 display_banner() {
@@ -297,6 +301,7 @@ restart_program() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_disable
     trans_proxy_disable
+    split_tunnel_cleanup
     dns_protect_disable
     reset_proxy
     stop_tor
@@ -339,6 +344,10 @@ kill_switch_enable() {
     iptables -A UNSEEN_KS -o lo -j ACCEPT
     # Allow traffic redirected to loopback by trans_proxy (destination rewritten by NAT)
     iptables -A UNSEEN_KS -d 127.0.0.0/8 -j ACCEPT
+    # Allow split tunnel destinations (bypass Tor, must survive Kill Switch)
+    for ip in $SPLIT_IPS; do
+        iptables -A UNSEEN_KS -d "$ip" -j ACCEPT
+    done
     # Allow LAN (private networks, RETURNed by trans_proxy)
     iptables -A UNSEEN_KS -d 10.0.0.0/8 -j ACCEPT
     iptables -A UNSEEN_KS -d 172.16.0.0/12 -j ACCEPT
@@ -392,6 +401,10 @@ trans_proxy_enable() {
     iptables -t nat -F UNSEEN_TP 2>/dev/null
     # Never touch Tor's own outbound traffic (prevents loops)
     iptables -t nat -A UNSEEN_TP -m owner --uid-owner "$TOR_SYS_USER" -j RETURN
+    # Split tunnel — bypass Tor for destinations listed in domains.txt
+    for ip in $SPLIT_IPS; do
+        iptables -t nat -A UNSEEN_TP -d "$ip" -j RETURN
+    done
     # Redirect DNS to Tor's DNSPort
     iptables -t nat -A UNSEEN_TP -p udp --dport 53 -j REDIRECT --to-ports 9053
     iptables -t nat -A UNSEEN_TP -p tcp --dport 53 -j REDIRECT --to-ports 9053
@@ -422,6 +435,57 @@ trans_proxy_disable() {
     fi
 }
 
+# Load split tunnel list — domains/IPs in domains.txt bypass Tor
+load_split_tunnel() {
+    [ ! -f "$DOMAINS_FILE" ] && return
+    local has_entry=0
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        local clean="${raw%%#*}"
+        clean=$(echo "$clean" | xargs)
+        [ -n "$clean" ] && has_entry=1 && break
+    done < "$DOMAINS_FILE"
+    [ "$has_entry" -eq 0 ] && return
+
+    printf "${YELLOW}[+] Loading split tunnel from ${DOMAINS_FILE}...${RESET}\n"
+    cp /etc/hosts /tmp/unseen_hosts.bak
+    HOSTS_MODIFIED=1
+    printf "\n# === UNSEEN SPLIT TUNNEL ===\n" >> /etc/hosts
+
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        local entry="${raw%%#*}"
+        entry=$(echo "$entry" | xargs)
+        [ -z "$entry" ] && continue
+
+        if echo "$entry" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$'; then
+            SPLIT_IPS="$SPLIT_IPS $entry"
+            printf "${GREEN}    ${entry}${RESET}\n"
+        else
+            local ips
+            ips=$(getent ahostsv4 "$entry" 2>/dev/null | awk '{print $1}' | sort -u)
+            if [ -n "$ips" ]; then
+                for ip in $ips; do
+                    SPLIT_IPS="$SPLIT_IPS $ip"
+                    echo "$ip $entry" >> /etc/hosts
+                done
+                printf "${GREEN}    ${entry} → $(echo $ips | tr '\n' ' ')${RESET}\n"
+            else
+                printf "${RED}    ${entry} (resolution failed)${RESET}\n"
+            fi
+        fi
+    done < "$DOMAINS_FILE"
+
+    printf "${GREEN}[+] Split tunnel active.${RESET}\n"
+}
+
+# Restore /etc/hosts
+split_tunnel_cleanup() {
+    if [ "$HOSTS_MODIFIED" -eq 1 ] && [ -f /tmp/unseen_hosts.bak ]; then
+        cp /tmp/unseen_hosts.bak /etc/hosts
+        rm -f /tmp/unseen_hosts.bak
+        HOSTS_MODIFIED=0
+    fi
+}
+
 # Ask user whether to enable IP rotation
 choose_rotation() {
     printf "${YELLOW}[?] Enable IP rotation? [y/n]: ${RESET}"
@@ -445,6 +509,7 @@ cleanup() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_disable
     trans_proxy_disable
+    split_tunnel_cleanup
     dns_protect_disable
     reset_proxy
     stop_tor
@@ -474,6 +539,7 @@ EOF
     fi
     start_tor
     set_proxy
+    load_split_tunnel
     dns_protect_enable
     trans_proxy_enable
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_enable

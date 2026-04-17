@@ -10,6 +10,10 @@ RED="\033[91m"
 KILL_SWITCH=0
 MONITOR_PID=""
 DNS_PROTECTED=0
+HOSTS_MODIFIED=0
+BYPASS_MODIFIED=0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOMAINS_FILE="$SCRIPT_DIR/../domains.txt"
 
 # Display banner
 display_banner() {
@@ -229,6 +233,87 @@ kill_switch_monitor() {
     MONITOR_PID=$!
 }
 
+# Load split tunnel list — domains/IPs in domains.txt bypass Tor
+load_split_tunnel() {
+    [ ! -f "$DOMAINS_FILE" ] && return
+    local has_entry=0
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        local clean="${raw%%#*}"
+        clean=$(echo "$clean" | xargs)
+        [ -n "$clean" ] && has_entry=1 && break
+    done < "$DOMAINS_FILE"
+    [ "$has_entry" -eq 0 ] && return
+
+    printf "${YELLOW}[+] Loading split tunnel from ${DOMAINS_FILE}...${RESET}\n"
+
+    local entries=""
+    cp /etc/hosts /tmp/unseen_hosts.bak
+    HOSTS_MODIFIED=1
+    printf "\n# === UNSEEN SPLIT TUNNEL ===\n" >> /etc/hosts
+
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        local entry="${raw%%#*}"
+        entry=$(echo "$entry" | xargs)
+        [ -z "$entry" ] && continue
+        entries="$entries $entry"
+
+        if echo "$entry" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$'; then
+            printf "${GREEN}    ${entry}${RESET}\n"
+        else
+            local ips
+            ips=$(dscacheutil -q host -a name "$entry" 2>/dev/null | awk '/^ip_address:/ {print $2}' | sort -u)
+            if [ -n "$ips" ]; then
+                for ip in $ips; do
+                    echo "$ip $entry" >> /etc/hosts
+                done
+                printf "${GREEN}    ${entry} → $(echo $ips | tr '\n' ' ')${RESET}\n"
+            else
+                printf "${RED}    ${entry} (resolution failed)${RESET}\n"
+            fi
+        fi
+    done < "$DOMAINS_FILE"
+
+    # Back up current bypass lists and apply new one per network service
+    : > /tmp/unseen_bypass.bak
+    while IFS= read -r service; do
+        [ -z "$service" ] && continue
+        local current
+        current=$(networksetup -getproxybypassdomains "$service" 2>/dev/null)
+        if echo "$current" | grep -q "There aren't"; then
+            echo "${service}|EMPTY" >> /tmp/unseen_bypass.bak
+        else
+            local cur_line
+            cur_line=$(echo "$current" | tr '\n' ' ')
+            echo "${service}|${cur_line}" >> /tmp/unseen_bypass.bak
+        fi
+        networksetup -setproxybypassdomains "$service" $entries 2>/dev/null
+    done <<< "$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | tail -n +2)"
+    BYPASS_MODIFIED=1
+
+    printf "${GREEN}[+] Split tunnel active.${RESET}\n"
+}
+
+# Restore /etc/hosts and proxy bypass list
+split_tunnel_cleanup() {
+    if [ "$HOSTS_MODIFIED" -eq 1 ] && [ -f /tmp/unseen_hosts.bak ]; then
+        cp /tmp/unseen_hosts.bak /etc/hosts
+        rm -f /tmp/unseen_hosts.bak
+        HOSTS_MODIFIED=0
+    fi
+    if [ "$BYPASS_MODIFIED" -eq 1 ] && [ -f /tmp/unseen_bypass.bak ]; then
+        while IFS='|' read -r service bypass_list; do
+            [ -z "$service" ] && continue
+            if [ "$bypass_list" = "EMPTY" ] || [ -z "$bypass_list" ]; then
+                networksetup -setproxybypassdomains "$service" "Empty" 2>/dev/null
+            else
+                networksetup -setproxybypassdomains "$service" $bypass_list 2>/dev/null
+            fi
+        done < /tmp/unseen_bypass.bak
+        rm -f /tmp/unseen_bypass.bak
+        BYPASS_MODIFIED=0
+    fi
+}
+
 # Enable DNS leak protection — route system DNS through Tor
 dns_protect_enable() {
     printf "${YELLOW}[+] Enabling DNS leak protection...${RESET}\n"
@@ -285,6 +370,7 @@ choose_rotation() {
 cleanup() {
     printf "\n${RED}[!] Disconnecting...${RESET}\n"
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
+    split_tunnel_cleanup
     dns_protect_disable
     reset_proxy
     stop_tor
@@ -310,6 +396,7 @@ EOF
     fi
     start_tor
     set_proxy
+    load_split_tunnel
     dns_protect_enable
     [ "$KILL_SWITCH" -eq 1 ] && kill_switch_monitor
     fetch_info

@@ -24,6 +24,7 @@ Route your internet traffic anonymously through the Tor network, directly from y
 - Routes all network traffic through the Tor SOCKS5 proxy (`127.0.0.1:9050`)
 - **DNS leak protection** — forces every DNS query through Tor's `DNSPort` so your ISP cannot see what you're resolving
 - **Transparent proxy** (Linux) — redirects all TCP traffic through Tor via `iptables` NAT, so every application is routed through Tor even if it ignores system proxy settings
+- **Split tunneling** — list domains or IPs in `domains.txt` to bypass Tor for specific destinations (useful for streaming, banking, or sites that block Tor)
 - Shows your anonymous IP, country, region and city once connected
 - On exit (`CTRL+C`), automatically stops Tor and resets all proxy, DNS and firewall settings
 
@@ -131,6 +132,43 @@ Requires a dedicated Tor system user (`debian-tor`, `tor`, or `_tor`) to avoid t
 
 On macOS the transparent proxy is not needed — `networksetup -setsocksfirewallproxy` applies system-wide and browsers honor it.
 
+## Split tunneling
+
+Unseen supports split tunneling via a plain-text file at the repo root: `domains.txt`.
+
+Any destination listed there **bypasses Tor** and uses your real connection. Useful for:
+- Streaming services that block Tor exits (Netflix, banking portals)
+- Local servers, NAS, internal corporate resources
+- Any site that flat-out refuses Tor traffic
+
+### Format
+
+One entry per line. Comments start with `#`. Three formats are accepted:
+
+```text
+# Domain name (resolved to its real IP at script startup)
+github.com
+
+# IPv4 address
+1.1.1.1
+
+# CIDR range (Linux only)
+192.168.10.0/24
+```
+
+### How it works
+
+- **Linux**: domains are resolved with `getent ahostsv4` *before* DNS is dirottato on Tor. The resolved IPs are written to `/etc/hosts` (so future lookups skip Tor) and added as `RETURN` rules in the `UNSEEN_TP` iptables NAT chain. If the Kill Switch is active, the same IPs are also added as `ACCEPT` rules in `UNSEEN_KS`.
+- **macOS**: domains are resolved with `dscacheutil -q host` and written to `/etc/hosts`. All entries are also added to every network service's SOCKS proxy bypass list via `networksetup -setproxybypassdomains`.
+
+Both platforms back up `/etc/hosts` (and the macOS bypass lists) before modifying them and restore them cleanly on exit.
+
+### Caveats
+
+- **IPs are resolved once at script startup.** If the domain's IPs change (common with large CDNs like Cloudflare), press `CTRL+R` to reload `domains.txt`.
+- Browsers cache DNS — you may need to restart the browser (or flush its internal DNS cache) after enabling/disabling split tunneling for an already-open session.
+- If the destination is in `domains.txt` but still appears to go through Tor, check `sudo iptables -t nat -L UNSEEN_TP -n` (Linux) or `networksetup -getproxybypassdomains <service>` (macOS).
+
 ## Testing for leaks
 
 Once connected, verify that everything is actually routed through Tor:
@@ -141,6 +179,11 @@ Once connected, verify that everything is actually routed through Tor:
    You should see **only** Tor exit-relay resolvers. No ISP, Google (`8.8.8.8`), or Cloudflare (`1.1.1.1`) resolvers.
 3. **IPv6 / WebRTC** — https://ipleak.net
    The IP shown must match the Tor exit node, not your real address.
+4. **Split tunnel check** — with a domain (e.g. `ifconfig.me`) listed in `domains.txt`:
+   ```bash
+   curl ifconfig.me                                   # → your real IP (bypassed Tor)
+   curl --socks5 127.0.0.1:9050 https://icanhazip.com # → a Tor exit IP
+   ```
 
 ## Exit node country codes
 
@@ -160,13 +203,14 @@ Some countries have many reliable exit nodes, others have few or none.
 5. Stops any existing Tor instance to avoid conflicts
 6. Starts Tor and waits for a full bootstrap (100%)
 7. Enables the SOCKS5 proxy on all active network interfaces
-8. Locks system DNS to `127.0.0.1` so all queries go through Tor's DNSPort
-9. (Linux) Installs `iptables` NAT rules to transparently redirect all TCP + DNS traffic through Tor
-10. If Kill Switch is enabled, enforces traffic blocking rules (Linux: `iptables` chain; macOS: background monitor)
-11. Fetches your anonymous IP and location through the Tor circuit
-12. Verifies the exit country matches the requested one (only when rotation is off) — if not, prompts to retry
-13. If rotation is on, changes Tor identity and refreshes connection info at the chosen interval
-14. On exit, tears down in reverse order: Kill Switch → transparent proxy → DNS overrides → SOCKS proxy → Tor process
+8. Reads `domains.txt` (if present) — resolves any domains to real IPs while the original DNS is still active, writes `/etc/hosts` entries and records the IPs for firewall exceptions
+9. Locks system DNS to `127.0.0.1` so all queries go through Tor's DNSPort
+10. (Linux) Installs `iptables` NAT rules to transparently redirect all TCP + DNS traffic through Tor, with `RETURN` exceptions for the split tunnel IPs
+11. If Kill Switch is enabled, enforces traffic blocking rules (Linux: `iptables` chain with `ACCEPT` for split tunnel IPs; macOS: background monitor)
+12. Fetches your anonymous IP and location through the Tor circuit
+13. Verifies the exit country matches the requested one (only when rotation is off) — if not, prompts to retry
+14. If rotation is on, changes Tor identity and refreshes connection info at the chosen interval
+15. On exit, tears down in reverse order: Kill Switch → transparent proxy → split tunnel (`/etc/hosts` + bypass list) → DNS overrides → SOCKS proxy → Tor process
 
 ## Notes
 

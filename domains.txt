@@ -1,0 +1,18 @@
+# Unseen — Split Tunnel list
+#
+# Destinations listed here bypass Tor and use your real connection.
+# Useful for: streaming services, banking sites that block Tor, local NAS,
+# or any site that refuses Tor exit nodes.
+#
+# Formats supported (one per line):
+#   - Domain name   (e.g. example.com)
+#   - IPv4 address  (e.g. 1.1.1.1)
+#   - CIDR range    (e.g. 192.168.0.0/24)
+#
+# Lines starting with # are comments.
+# Domains are resolved at script startup — if IPs change, press CTRL+R to reload.
+
+example.com
+github.com
+cloudflare.com
+ifconfig.me

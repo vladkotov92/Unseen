@@ -11,6 +11,7 @@ KILL_SWITCH=0
 TOR_SYS_USER=""
 DNS_PROTECTED=0
 TRANS_PROXY=0
+SPLIT_TUNNEL=0
 SPLIT_IPS=""
 HOSTS_MODIFIED=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -370,7 +371,19 @@ kill_switch_disable() {
 # Enable DNS leak protection (resolv.conf only)
 dns_protect_enable() {
     printf "${YELLOW}[+] Locking resolv.conf to 127.0.0.1...${RESET}\n"
-    cp /etc/resolv.conf /tmp/resolv.conf.bak 2>/dev/null
+
+    # Only create a new backup if none exists — preserves a good backup across a crashed run.
+    # Also: never save our own "nameserver 127.0.0.1" placeholder as a backup.
+    if [ ! -f /tmp/resolv.conf.bak ]; then
+        local meaningful
+        meaningful=$(grep -vE '^\s*(#|$)' /etc/resolv.conf 2>/dev/null | tr -d '[:space:]')
+        if [ "$meaningful" = "nameserver127.0.0.1" ]; then
+            printf "# unseen: no valid DNS snapshot available\n" > /tmp/resolv.conf.bak
+        else
+            cp /etc/resolv.conf /tmp/resolv.conf.bak 2>/dev/null
+        fi
+    fi
+
     chattr -i /etc/resolv.conf 2>/dev/null
     printf "nameserver 127.0.0.1\n" > /etc/resolv.conf
     chattr +i /etc/resolv.conf 2>/dev/null
@@ -381,10 +394,33 @@ dns_protect_enable() {
 dns_protect_disable() {
     if [ "$DNS_PROTECTED" -eq 1 ]; then
         chattr -i /etc/resolv.conf 2>/dev/null
+
+        local backup_ok=0
         if [ -f /tmp/resolv.conf.bak ]; then
-            cp /tmp/resolv.conf.bak /etc/resolv.conf
+            local backup_content
+            backup_content=$(grep -vE '^\s*(#|$)' /tmp/resolv.conf.bak 2>/dev/null | tr -d '[:space:]')
+            if [ -n "$backup_content" ] && [ "$backup_content" != "nameserver127.0.0.1" ]; then
+                cp /tmp/resolv.conf.bak /etc/resolv.conf
+                backup_ok=1
+            fi
             rm -f /tmp/resolv.conf.bak
         fi
+
+        if [ "$backup_ok" -eq 0 ]; then
+            printf "${YELLOW}[!] No valid DNS backup — regenerating via NetworkManager...${RESET}\n"
+            rm -f /etc/resolv.conf
+            if command -v resolvectl >/dev/null 2>&1; then
+                resolvectl flush-caches 2>/dev/null
+            fi
+            if command -v nmcli >/dev/null 2>&1; then
+                nmcli networking off >/dev/null 2>&1
+                sleep 1
+                nmcli networking on >/dev/null 2>&1
+            elif command -v systemctl >/dev/null 2>&1; then
+                systemctl try-restart NetworkManager 2>/dev/null || systemctl try-restart systemd-resolved 2>/dev/null
+            fi
+        fi
+
         DNS_PROTECTED=0
     fi
 }
@@ -435,8 +471,22 @@ trans_proxy_disable() {
     fi
 }
 
+# Ask user whether to enable split tunneling
+choose_split_tunnel() {
+    printf "${YELLOW}[?] Enable Split Tunneling? (domains/IPs in domains.txt bypass Tor) [y/n]: ${RESET}"
+    read -r ST_CHOICE
+    ST_CHOICE=$(echo "$ST_CHOICE" | tr '[:upper:]' '[:lower:]')
+    if [ "$ST_CHOICE" = "y" ]; then
+        SPLIT_TUNNEL=1
+        printf "${GREEN}[+] Split Tunneling will be enabled.${RESET}\n"
+    else
+        SPLIT_TUNNEL=0
+    fi
+}
+
 # Load split tunnel list — domains/IPs in domains.txt bypass Tor
 load_split_tunnel() {
+    [ "$SPLIT_TUNNEL" -eq 1 ] || return
     [ ! -f "$DOMAINS_FILE" ] && return
     local has_entry=0
     while IFS= read -r raw || [ -n "$raw" ]; do
@@ -526,6 +576,7 @@ main() {
     kill_switch_disable
     choose_rotation
     choose_kill_switch
+    choose_split_tunnel
     if [ "$ROTATE_IP" = "y" ]; then
         cat > /tmp/torrc << EOF
 SocksPort 9050

@@ -10,6 +10,7 @@ RED="\033[91m"
 KILL_SWITCH=0
 MONITOR_PID=""
 DNS_PROTECTED=0
+SPLIT_TUNNEL=0
 HOSTS_MODIFIED=0
 BYPASS_MODIFIED=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -233,8 +234,22 @@ kill_switch_monitor() {
     MONITOR_PID=$!
 }
 
+# Ask user whether to enable split tunneling
+choose_split_tunnel() {
+    printf "${YELLOW}[?] Enable Split Tunneling? (domains/IPs in domains.txt bypass Tor) [y/n]: ${RESET}"
+    read -r ST_CHOICE
+    ST_CHOICE=$(echo "$ST_CHOICE" | tr '[:upper:]' '[:lower:]')
+    if [ "$ST_CHOICE" = "y" ]; then
+        SPLIT_TUNNEL=1
+        printf "${GREEN}[+] Split Tunneling will be enabled.${RESET}\n"
+    else
+        SPLIT_TUNNEL=0
+    fi
+}
+
 # Load split tunnel list — domains/IPs in domains.txt bypass Tor
 load_split_tunnel() {
+    [ "$SPLIT_TUNNEL" -eq 1 ] || return
     [ ! -f "$DOMAINS_FILE" ] && return
     local has_entry=0
     while IFS= read -r raw || [ -n "$raw" ]; do
@@ -317,18 +332,33 @@ split_tunnel_cleanup() {
 # Enable DNS leak protection — route system DNS through Tor
 dns_protect_enable() {
     printf "${YELLOW}[+] Enabling DNS leak protection...${RESET}\n"
-    : > /tmp/dns_backup.txt
+
+    # Only create a new backup if none exists — preserves a good backup across a crashed run.
+    # Also: never save "127.0.0.1" as a backup entry (our own placeholder).
+    if [ ! -f /tmp/dns_backup.txt ]; then
+        : > /tmp/dns_backup.txt
+        while IFS= read -r service; do
+            [ -z "$service" ] && continue
+            current_dns=$(networksetup -getdnsservers "$service" 2>/dev/null)
+            if echo "$current_dns" | grep -q "There aren't"; then
+                echo "${service}|EMPTY" >> /tmp/dns_backup.txt
+            else
+                dns_line=$(echo "$current_dns" | tr '\n' ' ' | xargs)
+                if [ "$dns_line" = "127.0.0.1" ]; then
+                    echo "${service}|EMPTY" >> /tmp/dns_backup.txt
+                else
+                    echo "${service}|${dns_line}" >> /tmp/dns_backup.txt
+                fi
+            fi
+        done <<< "$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | tail -n +2)"
+    fi
+
+    # Apply 127.0.0.1 to every active service
     while IFS= read -r service; do
         [ -z "$service" ] && continue
-        current_dns=$(networksetup -getdnsservers "$service" 2>/dev/null)
-        if echo "$current_dns" | grep -q "There aren't"; then
-            echo "${service}|EMPTY" >> /tmp/dns_backup.txt
-        else
-            dns_line=$(echo "$current_dns" | tr '\n' ' ')
-            echo "${service}|${dns_line}" >> /tmp/dns_backup.txt
-        fi
         networksetup -setdnsservers "$service" "127.0.0.1" 2>/dev/null
     done <<< "$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | tail -n +2)"
+
     DNS_PROTECTED=1
     printf "${GREEN}[+] DNS leak protection active.${RESET}\n"
 }
@@ -338,7 +368,8 @@ dns_protect_disable() {
     if [ "$DNS_PROTECTED" -eq 1 ] && [ -f /tmp/dns_backup.txt ]; then
         while IFS='|' read -r service dns_list; do
             [ -z "$service" ] && continue
-            if [ "$dns_list" = "EMPTY" ] || [ -z "$dns_list" ]; then
+            # Guard: if backup accidentally holds our placeholder, fall back to DHCP
+            if [ "$dns_list" = "EMPTY" ] || [ -z "$dns_list" ] || [ "$dns_list" = "127.0.0.1" ]; then
                 networksetup -setdnsservers "$service" "Empty" 2>/dev/null
             else
                 networksetup -setdnsservers "$service" $dns_list 2>/dev/null
@@ -385,6 +416,7 @@ main() {
     check_dependencies
     choose_rotation
     choose_kill_switch
+    choose_split_tunnel
     if [ "$ROTATE_IP" = "y" ]; then
         cat > /tmp/torrc << EOF
 SocksPort 9050
